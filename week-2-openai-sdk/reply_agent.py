@@ -4,7 +4,8 @@ import imaplib
 import email
 from email.header import decode_header
 import time
-import sqlite3 # NEW: Import sqlite3
+import sqlite3
+import traceback # NEW: Import traceback for detailed error logging
 from dotenv import load_dotenv
 from agents import Agent, Runner, function_tool
 import sendgrid
@@ -15,11 +16,8 @@ import asyncio
 
 load_dotenv()
 print("INFO: Loading credentials for Reply Agent...")
-
-# Database file for checking outreach recipients
-DB_FILE = "outreach_log.db" # UPDATED: Database file name
-
-# Credentials
+DB_FILE = "outreach_log.db"
+# ... (rest of credentials loading is the same) ...
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 SENDGRID_SENDER = os.getenv("SENDGRID_SENDER")
 IMAP_SERVER = os.getenv("IMAP_SERVER")
@@ -27,29 +25,22 @@ IMAP_EMAIL = os.getenv("IMAP_EMAIL")
 IMAP_APP_PASSWORD = os.getenv("IMAP_APP_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME")
-IMAP_REPLY_TO_EMAIL = os.getenv("IMAP_REPLY_TO_EMAIL")
-
 if not all([SENDGRID_API_KEY, SENDGRID_SENDER, IMAP_SERVER, IMAP_EMAIL, IMAP_APP_PASSWORD, OPENAI_API_KEY, OPENAI_MODEL_NAME]):
     print("ERROR: One or more environment variables for SendGrid, IMAP, or OpenAI are not set.")
     exit()
-
 sg_client = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
 print("INFO: Clients configured.")
-
 def load_all_company_info(directory="company"):
-    # This remains useful for the RAG tool
     all_content = ""
     files = glob.glob(os.path.join(directory, "*.md"))
     for file_path in files:
         with open(file_path, 'r') as f:
             all_content += f.read() + "\n\n---\n\n"
     return all_content
-
 ALL_COMPANY_INFO = load_all_company_info()
-if not ALL_COMPANY_INFO:
-    print("WARNING: No company information found for RAG tool.")
+if not ALL_COMPANY_INFO: print("WARNING: No company information found for RAG tool.")
 
-# --- 2. TOOLS (No changes to tool logic) ---
+# --- 2. UPDATED TOOL WITH BETTER DEBUGGING ---
 
 @function_tool
 def query_company_knowledge_base(query: str) -> str:
@@ -64,24 +55,30 @@ def send_email(to_email: str, subject: str, body: str) -> str:
     """
     Sends an email reply to a specified recipient.
     """
-    print(f"INFO: Email Tool called: Sending reply to {to_email}")
+    print(f"DEBUG: Entering 'send_email' tool for {to_email}.") # New debug print
     try:
         from_email_obj = Email(SENDGRID_SENDER)
         to_email_obj = To(to_email)
         content = Content("text/plain", body)
-        reply_to_email_obj = ReplyTo(IMAP_REPLY_TO_EMAIL)
         mail = Mail(from_email_obj, to_email_obj, subject, content)
-        mail.reply_to = reply_to_email_obj
+        
+        print("DEBUG: Calling SendGrid API now...") # New debug print
         response = sg_client.client.mail.send.post(request_body=mail.get())
+        
         if response.status_code >= 200 and response.status_code < 300:
+            print(f"SUCCESS: Reply sent successfully to {to_email}.")
             return "Email reply sent successfully."
         else:
-            return f"Failed to send email. Status: {response.status_code}"
+            error_message = f"Failed to send email. Status: {response.status_code}. Body: {response.body}"
+            print(f"ERROR: {error_message}")
+            return error_message
     except Exception as e:
+        # NEW: Print the full traceback for detailed debugging
+        print("ERROR: An unexpected exception occurred inside the send_email tool.")
+        traceback.print_exc()
         return f"An exception occurred: {e}"
 
-# --- 3. AGENT DEFINITION (No changes here) ---
-
+# --- 3. AGENT DEFINITION (No changes) ---
 alex_reply_instructions = f"""
 You are "Alex," a professional and helpful Business Development Representative for Sentinel AI.
 Your goal is to engage in a conversation with a potential customer who has replied to one of your emails.
@@ -97,7 +94,6 @@ RULES:
 4.  Ensure your reply's subject line is appropriate (e.g., prepending "Re: " to the original subject).
 5.  Once you have the final response crafted, you MUST use the `send_email` tool to send your reply.
 """
-
 alex_reply_agent = Agent(
     name="Alex (Reply)",
     instructions=alex_reply_instructions,
@@ -105,8 +101,7 @@ alex_reply_agent = Agent(
     model=OPENAI_MODEL_NAME,
 )
 
-# --- 4. UPDATED LIVE EMAIL CHECKING & DB-POWERED HANDLING ---
-
+# --- 4. EMAIL CHECKING & HANDLING (No changes) ---
 def check_for_new_replies():
     new_emails = []
     try:
@@ -132,52 +127,39 @@ def check_for_new_replies():
             else:
                 if msg.get_content_type() == "text/plain": body = msg.get_payload(decode=True).decode()
             new_emails.append({"from": from_email_address, "subject": subject, "body": body.strip()})
-            mail.store(num, '+FLAGS', '\Seen')
+            mail.store(num, '+FLAGS', '\\Seen')
         mail.logout()
     except Exception as e: print(f"ERROR: Failed to check emails: {e}")
     return new_emails
 
 async def handle_inbound_email(customer_email: str, subject: str, body: str):
-    """
-    Processes an inbound email, first checking if the sender is in the outreach log.
-    """
     print("\n" + "="*50)
     print(f"INFO: New email received from: {customer_email}")
-
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-
-    # --- NEW: Check if this is a reply from a known conversation ---
     cursor.execute("SELECT id FROM outreach_recipients WHERE recipient_email = ?", (customer_email,))
     result = cursor.fetchone()
-    conn.close() # We can close the connection right after the check
-
+    conn.close()
     if not result:
         print(f"INFO: Ignoring email from {customer_email} as they are not in the outreach log.")
-        return # Stop processing this email
-
-    # --- If we get here, the email is from a known recipient ---
+        return
     print(f"INFO: Sender {customer_email} found in outreach log. Triggering Alex (Reply Agent)...")
-
     agent_prompt = f"""
-A customer with email '{customer_email}' has replied to you.
-Their subject line is: '{subject}'.
-The full content of their message, which may include previous conversation, is:
----
-{body}
----
-Please process this email and send a helpful, conversational reply.
-"""
+    A customer with email '{customer_email}' has replied to you.
+    Their subject line is: '{subject}'.
+    The full content of their message is:
+    ---
+    {body}
+    ---
+    Please process this email and send a helpful, conversational reply.
+    """
     await Runner.run(alex_reply_agent, input=agent_prompt)
     print("INFO: Agent has finished processing the reply.")
 
-
-# --- 5. MAIN AGENT LOOP (No changes here) ---
-
+# --- 5. MAIN LOOP (No changes) ---
 def main():
     print("INFO: Starting Sentinel AI Reply Agent (with DB filter)...")
     print("INFO: Press Ctrl+C to stop the agent.")
-    
     while True:
         try:
             new_emails = check_for_new_replies()
